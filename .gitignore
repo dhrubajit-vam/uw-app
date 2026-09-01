@@ -1,0 +1,11 @@
+# Secrets - never commit
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+
+# Local source workbook copy (large, synthetic data only, kept out of git)
+*.xlsx

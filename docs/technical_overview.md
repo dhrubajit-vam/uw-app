@@ -1,0 +1,413 @@
+# US Personal Auto Underwriting & Pricing — Technical Overview
+
+**Audience:** Technical/architecture review
+**Scope:** What's running under the hood, which models were chosen, and why — not a user guide (see `docs/demo_guide.html` for that).
+
+---
+
+## 1. Architecture, top to bottom
+
+The system is deliberately split into independent layers so that no single
+component is a black box making an end-to-end decision. This mirrors how a
+real carrier's actuarial/underwriting/pricing functions are organized —
+different teams, different governance, different sign-off — rather than one
+model that predicts "the premium" directly.
+
+```
+Raw submission (form input or historical row)
+        │
+        ▼
+┌───────────────────────┐
+│  3 ML MODELS           │  Frequency, Severity, Bind Probability
+│  (independently        │  Each trained on its own feature set, no leakage
+│   trained, leak-safe)  │  between them (see §3).
+└───────────┬───────────┘
+        ▼
+┌───────────────────────┐
+│  DETERMINISTIC RULES   │  Composite score, technical premium, business
+│  ENGINE (non-ML)       │  premium, hard-stops, risk band, recommended
+│  rules/rules_engine.py │  action. Pure business formulas — auditable,
+│                        │  reproducible, not learned.
+└───────────┬───────────┘
+        ▼
+┌───────────────────────┐
+│  EXPLAINABILITY        │  SHAP-exact reason codes (loss + bind) and an
+│  scoring/explain.py    │  exact decomposition of the appetite penalty
+│                        │  formula. Every number is reproducible.
+└───────────┬───────────┘
+        ▼
+┌───────────────────────┐
+│  ADVISOR               │  Coverage-fit comparison and "alternatives to a
+│  scoring/advisor.py    │  decline" — re-simulated through the SAME rules
+│                        │  engine with modified inputs, never fabricated.
+└───────────┬───────────┘
+        ▼
+┌───────────────────────┐
+│  AI NARRATIVE (opt.)   │  Azure OpenAI GPT-4o turns the above into plain
+│  scoring/ai_narrator.py│  English. It narrates; it never decides. Falls
+│                        │  back to rule-based text if unavailable.
+└───────────┬───────────┘
+        ▼
+┌───────────────────────┐
+│  STREAMLIT UI          │  Dashboard tab (book-wide KPIs) + Interface tab
+│  app/app.py            │  (live single-submission scoring / what-if).
+└───────────────────────┘
+```
+
+**Why this separation matters:** if a regulator or auditor asks "why was
+this risk declined," the answer traces to a specific, inspectable rule
+(`rules_engine.check_hard_stops`) or a specific, exact Shapley contribution
+— never "the model decided." The only genuinely probabilistic, non-exact
+component (the AI narrative) is explicitly walled off from ever producing a
+number, band, or decision.
+
+---
+
+## 2. The three ML models — what and why
+
+All three are trained in `train/train_*.py`, loaded via
+`scoring/predictors.py`, and consumed by the rules engine as inputs, not
+replacements for it.
+
+### 2.1 Claim Frequency — XGBoost Regressor, `objective="count:poisson"`
+
+- **Target:** `Claim_Count` per policy-year (a count, not a probability).
+- **Why gradient-boosted trees over a classical Poisson GLM:** frequency in
+  auto insurance is driven by nonlinear interactions (e.g., young driver ×
+  urban territory × high mileage compounds differently than any one factor
+  alone). A Poisson GLM assumes additive-in-the-link effects; XGBoost with a
+  Poisson objective keeps the correct count-data loss function (log-link,
+  Poisson deviance) while letting the trees discover those interactions
+  without hand-engineering interaction terms.
+- **Why not a plain regressor (squared error):** claim counts are
+  non-negative integers with a right-skewed distribution — a Poisson
+  objective is the standard actuarial choice for frequency; squared-error
+  regression would let the model predict nonsensical negative frequencies
+  and mis-weight rare high-count cases.
+- Trained only on bound policies (`Bound_Flag == 1`) — you only observe
+  claims experience on business that was actually written.
+
+### 2.2 Claim Severity — Gamma GLM (`statsmodels`), log link
+
+- **Target:** `Incurred_Loss / Claim_Count` (average cost per claim, only
+  defined where at least one claim occurred).
+- **Why a classical GLM here instead of another gradient-boosted model:**
+  severity is the standard home turf of the Gamma-GLM-with-log-link in
+  actuarial pricing (severity is strictly positive and right-skewed — the
+  Gamma family's variance-mean relationship matches that shape correctly).
+  Just as importantly, a GLM's coefficients give an **exact**, not
+  approximated, per-feature dollar contribution (coefficient × value in log
+  space) — no post-hoc explainability technique is needed for severity, it's
+  intrinsically interpretable. That exactness matters more for severity
+  than frequency because severity dollar amounts flow directly into the
+  premium, and finance/actuarial sign-off tends to expect GLM-style
+  transparency on the cost side specifically.
+- Deliberately a **different model family from frequency** — this is
+  intentional, not inconsistency: frequency and severity are actuarially
+  distinct processes (how often vs. how much) with different appropriate
+  distributions, and combining them multiplicatively (`frequency × severity
+  = expected loss cost`) is the standard actuarial decomposition.
+
+### 2.3 Bind Probability — LightGBM Classifier
+
+- **Target:** `Bound_Flag` (did the customer accept the quote?).
+- **Why LightGBM over XGBoost or logistic regression here:** this is a
+  behavioral/conversion problem (shopping behavior, price sensitivity,
+  channel, premium change vs. last year), which tends to have more
+  categorical structure and weaker, noisier signal than a loss-cost model.
+  LightGBM's leaf-wise tree growth handles a high proportion of categorical
+  splits (channel, price-sensitivity band, state) efficiently and trains
+  fast, which matters because this model is also re-invoked repeatedly per
+  what-if scenario (coverage fit across 5 options, up to 3 underwriter
+  alternatives) — LightGBM's speed keeps the live Interface tab responsive.
+- Trained on the full book (every quoted submission has a bind outcome,
+  unlike claims which are conditional on binding).
+
+### 2.4 Why three separate models instead of one end-to-end model
+
+This is a deliberate governance decision, enforced in code
+(`train/feature_config.py`):
+
+- Loss models (frequency, severity) **never** see bind/shopping-behavior
+  features (agent engagement, price sensitivity, quote revisions).
+- The bind model **never** sees loss/claims-history features.
+- No model ever sees another model's *output* (composite score, bind
+  score, etc.) fed back in as an input, and none see post-outcome fields
+  (`Bound_Flag`, `Claim_Count`, `Incurred_Loss`) except as their own
+  training target.
+
+A single unified "predict the premium" model would blur two things that
+must stay independently auditable in a regulated line: the actuarial cost
+of risk (loss models) and the commercial likelihood of conversion (bind
+model). Regulators expect rate filings to be justified on loss-cost
+grounds; conflating that with bind-probability-driven pricing in one
+model would be difficult to defend in a filing.
+
+### 2.5 Why not a neural network anywhere in this pipeline
+
+- The training set is ~22,000 rows — far too small to justify a neural
+  network over gradient-boosted trees / GLMs, which are the empirically
+  stronger choice on tabular data at this scale and are dramatically
+  easier to explain to underwriters, actuaries, and regulators.
+- Every model chosen here (XGBoost, LightGBM, GLM) has a **native, exact**
+  per-instance explainability mechanism (see §4) — a neural net would need
+  an approximate post-hoc method (e.g. KernelSHAP) instead of an exact one.
+
+---
+
+## 3. Preprocessing & validation methodology (`train/preprocessing.py`, `train/splits.py`)
+
+- **Imputation:** numeric features → median; categorical features →
+  most-frequent, then one-hot encoded (`handle_unknown="ignore"`, so a
+  category never seen in training — e.g. a body type not in the historical
+  book — degrades safely to "no signal" instead of crashing).
+- **Same preprocessor pickled with each model** so live single-row scoring
+  in the Streamlit app applies byte-identical preprocessing to what the
+  model was trained on.
+- **Time-based train/test split** (80/20 by `Quote_Date`, not random): the
+  model trains on the earlier ~80% of the book and validates on the most
+  recent ~20%. This avoids look-ahead leakage and mirrors how you'd
+  actually validate a pricing model in production — train on history,
+  test against "the future" — rather than a random split that could leak
+  information across time.
+- Per-model held-out predictions are persisted (`*_test_predictions.parquet`)
+  for `train/evaluate_models.py` to score independently.
+
+---
+
+## 4. Explainability — exact, not approximated (`scoring/explain.py`)
+
+- **Loss reason codes:** XGBoost and LightGBM both compute true per-instance
+  Shapley-value decompositions natively (`pred_contribs` / `pred_contrib`)
+  — this is the same mathematical mechanism the third-party `shap` package
+  wraps for tree models, so no extra dependency is needed and there's no
+  approximation error. Frequency uses a log link (Poisson) and severity a
+  log link (Gamma), so `log(frequency) + log(severity) = log(expected loss
+  cost)` exactly — the two contribution sets are on a common scale and can
+  be summed feature-by-feature into one combined "Loss Risk Drivers" list.
+- **Bind reason codes:** same native SHAP mechanism against the LightGBM
+  classifier.
+- **Appetite reason codes:** not a model at all — an exact decomposition of
+  the deterministic penalty formula in `rules_engine.compute_appetite_score`.
+  There's nothing approximate to explain; it's arithmetic.
+- **Reconciliation:** the app's "Technical & audit detail" panel shows the
+  model's base value plus every driver's contribution (named + pooled)
+  reproducing the final predicted figure exactly — a hard guarantee that
+  the explanation isn't just "directionally plausible" but numerically
+  ties out.
+
+---
+
+## 5. The deterministic rules engine — why it's *not* ML (`rules/rules_engine.py`)
+
+Three things are intentionally kept out of any model and hard-coded as
+auditable business formulas instead:
+
+1. **Hard-stop eligibility rules** (DUI, license suspension, confirmed
+   fraud, coverage lapse > 60 days, vehicle value over the carrier limit,
+   etc.) — these must be traceable to "we declined you because of rule X,"
+   not a model's learned pattern that could drift or can't be cited in an
+   adverse-action notice.
+2. **Premium loads** (10% LAE, 18% expense, 2–7% profit margin, CAT load,
+   risk load) — these are actuarial/finance policy assumptions set by
+   leadership, not something a model should fit from data.
+3. **Composite score weighting** (50% loss / 20% bind / 30% appetite) and
+   band thresholds (Preferred/Standard/Non-Standard/Decline) — a risk-
+   appetite policy choice, reviewed and set by underwriting management.
+
+The rules engine's only ML inputs are the three model outputs (expected
+frequency, severity, bind probability) — everything downstream of that is
+plain, versioned Python arithmetic that produces the same output for the
+same input, every time.
+
+---
+
+## 6. AI narrative layer — Azure OpenAI GPT-4o (`scoring/ai_narrator.py`)
+
+- **What it does:** turns the deterministic scoring/explainability/
+  recommendation output into a polished, plain-English underwriter
+  narrative.
+- **What it never does:** decide anything. Every number, band, premium,
+  reason code, and alternative shown elsewhere in the app is computed by
+  the rules engine / models *before* this module ever runs — the LLM is
+  instructed to only phrase and prioritize those given facts, never invent
+  new ones.
+- **Why an LLM here at all, given everything above is deterministic:**
+  underwriters read dozens of these a day; a fluent narrative summarizing
+  "why," phrased for a human, is a genuine productivity aid — but only
+  because it's layered on top of numbers that are already correct and
+  auditable, not used to *produce* those numbers.
+- **Failure mode by design:** if the API is unreachable, misconfigured, or
+  errors for any reason, every function returns `None` and callers fall
+  back to the plain rule-based text that already existed. A live demo (or
+  production run) never breaks because an AI call failed — the app is
+  fully functional with zero AI narrative at all.
+- Credentials are read from environment variables locally (`.env`, git-
+  ignored) or Streamlit's Secrets manager in the cloud deployment — the key
+  never lives in the repo.
+
+---
+
+## 7. Underwriter alternatives & coverage fit — re-simulated, not fabricated (`scoring/advisor.py`)
+
+When a submission lands in Decline or Hard Stop, real underwriters look for
+a way to write the business rather than sending a form-letter decline. The
+`advisor` module surfaces those alternatives (raise deductibles, require
+telematics, quote at a non-standard load, reclassify business use, etc.) by
+literally re-running the exact same scoring path (`score_submission`) with
+the modified input — every number shown (composite score, premium, band)
+is a genuine re-score, not a plausible-sounding guess. Only reasons with
+zero underwriting discretion (DUI, license suspension, confirmed fraud) get
+no alternative offered at all, because none legitimately exists.
+
+Coverage fit works the same way: the same risk is scored under all 5
+coverage options, because switching coverage actually changes the
+Collision/Comprehensive/UM-UIM flags the loss models read — it moves the
+predicted loss cost and technical premium, not just an appetite bonus.
+
+---
+
+## 8. Tech stack summary
+
+| Layer | Technology | Why |
+|---|---|---|
+| Frequency model | `xgboost.XGBRegressor` (Poisson objective) | Nonlinear interactions + correct count-data loss |
+| Severity model | `statsmodels` GLM (Gamma, log link) | Actuarial standard for positive skewed cost; exact coefficients |
+| Bind model | `lightgbm.LGBMClassifier` | Fast, handles categorical/behavioral features well |
+| Preprocessing | `scikit-learn` `ColumnTransformer` (median/most-frequent impute + one-hot) | Identical pipeline at train and inference time |
+| Explainability | Native SHAP (`pred_contribs`/`pred_contrib`) | Exact, not approximated; no extra dependency |
+| Rules/pricing | Plain Python (`rules/rules_engine.py`) | Auditable, reproducible, policy-owned, not learned |
+| AI narrative | Azure OpenAI (GPT-4o) via `openai` SDK | Narrates only; graceful fallback if unavailable |
+| App/UI | `streamlit`, `plotly` | Rapid internal tooling, native charting |
+| Data | `pandas`/`pyarrow` (Parquet), synthetic 22,000-row book | Fast columnar I/O for the batch-scored book |
+
+---
+
+## 9. Other model types considered / why not
+
+To be direct about what's actually in this repo versus what a review would
+typically ask about: **no alternative model type was benchmarked in
+code** — `train/evaluate_models.py` reports the three shipped models'
+own held-out performance (lift/calibration tables, deviance, AUC/log-loss/
+Brier), not a bake-off against other candidates. That's worth stating
+plainly rather than implying a comparison happened that didn't. What
+follows is the standard alternative for each model and why it wasn't the
+better fit here:
+
+| Model | Standard alternative | Why it wasn't chosen instead |
+|---|---|---|
+| Frequency | Poisson **GLM** (no trees) | Additive-only; misses the nonlinear interactions (age × territory × mileage) that gradient boosting captures without hand-built interaction terms |
+| Frequency | **Tweedie GLM/GBM** modeling frequency × severity jointly as one "pure premium" target | Common in practice, but collapses two actuarially distinct processes into one model and one set of diagnostics - harder to explain "why is this expensive" (frequency-driven vs. severity-driven) to an underwriter |
+| Severity | **Log-normal** OLS on log(severity) | Gamma is the closer distributional match to claim-severity's shape (Gamma's variance ∝ mean², matching how large claims are also more variable) and gives a direct multiplicative interpretation via the log link |
+| Severity | Gradient-boosted regressor (XGBoost, same family as frequency) | Would drop the exact-coefficient explainability the Gamma GLM gives for free; considered, not used, specifically to keep severity's dollar-driver explanations exact rather than SHAP-approximated |
+| Bind | **Logistic regression** | Simpler and directly interpretable, but weaker on the categorical/behavioral feature mix here (channel, price-sensitivity band, state) without manual interaction terms; LightGBM was chosen over XGBoost for this one specifically for training/inference speed on repeated what-if re-scoring |
+| All three | Neural network | Ruled out outright at ~22,000 rows - not enough data to earn a benefit over trees/GLMs, and would trade away the exact native explainability described in §4 for an approximate post-hoc method |
+
+If a formal bake-off against these alternatives is wanted for the review,
+that's a follow-on exercise (retrain each candidate on the same
+time-based split, compare on the same lift/calibration/AUC metrics
+`evaluate_models.py` already reports) - flag it and it can be scoped
+separately.
+
+---
+
+## 10. Global feature importance — what actually drives each model
+
+Per-submission reason codes (§4) answer "why did *this* risk score this
+way." The question "what drives the model overall" is different — it's
+the **mean absolute SHAP contribution across many rows**, not just one.
+Computed directly against the three shipped models over a 4,000-row sample
+of the book (not estimated/guessed):
+
+**Frequency (XGBoost, true Shapley contributions via `pred_contribs`):**
+
+| Rank | Feature | Share of total |
+|---|---|---|
+| 1 | Annual Mileage | 13.1% |
+| 2 | Driver Age | 7.1% |
+| 3 | Prior Claims (5Y) | 4.2% |
+| 4 | Rapid Acceleration Rate | 3.9% |
+| 5 | Months Since Last Claim | 3.2% |
+| 6 | Distracted Driving Score | 2.9% |
+| 7 | Moving Violations (3Y) | 2.7% |
+| 8 | Speeding Rate | 2.7% |
+| 9 | Vehicle Theft Risk Score | 2.7% |
+| 10 | Years Licensed | 2.6% |
+
+**Severity (Gamma GLM, |coefficient × value|):**
+
+| Rank | Feature | Share of total |
+|---|---|---|
+| 1 | Telematics Safety Score | 31.7% |
+| 2 | CAT Exposure Score | 11.1% |
+| 3 | Medical Cost Index | 6.7% |
+| 4 | Distracted Driving Score | 5.1% |
+| 5 | Speeding Rate | 4.4% |
+| 6 | Hail Risk Score | 3.2% |
+| 7 | Hard Braking Rate | 3.1% |
+| 8 | Flood Risk Score | 2.6% |
+| 9 | Repairability Score | 2.4% |
+| 10 | Weather Risk Score | 2.3% |
+
+*Caveat specific to this table:* unlike the tree models' Shapley values,
+this is the GLM's raw `coefficient × feature value`, not zero-centered
+against a baseline — a feature with a large coefficient and a large
+typical value (e.g. Telematics Safety Score, which is imputed to the
+population median for the ~majority of rows that aren't telematics-
+enrolled) can rank higher here than it would in a properly centered
+decomposition. It's the same computation the app already uses for
+per-submission severity reason codes (`explain.py`), just aggregated
+across rows — so it's consistent with what's on screen, but it should be
+read as "which features carry the most weight in the formula," not a
+strictly apples-to-apples ranking against the frequency/bind tables.
+
+**Bind Probability (LightGBM, true Shapley contributions via `pred_contrib`):**
+
+| Rank | Feature | Share of total |
+|---|---|---|
+| 1 | Premium Change Percentage (vs. last year) | 24.9% |
+| 2 | Final Quoted Premium | 13.0% |
+| 3 | Multi-Policy: No | 9.3% |
+| 4 | Customer Tenure (Years) | 8.8% |
+| 5 | Agent Engagement Score | 4.9% |
+| 6 | Submission Channel: Agent | 4.7% |
+| 7 | Submission Channel: Aggregator | 4.0% |
+| 8 | Prior Year Premium | 4.0% |
+| 9 | Quote Revisions | 3.9% |
+| 10 | Digital Engagement Score | 3.4% |
+
+**Read across all three:** frequency is driven mostly by exposure/behavior
+(mileage, age, prior claims, telematics behavior signals); severity is
+driven by cost-environment factors (CAT/weather exposure, medical cost
+index) plus the telematics caveat above; bind is overwhelmingly a pricing-
+shock and relationship story (premium change, tenure, multi-policy,
+channel) — which is exactly the "behavioral, not loss-cost" separation
+§2.4 argues the three-model design exists to preserve.
+
+---
+
+## 11. Common technical-review questions, answered directly
+
+**"Why three models instead of one?"** — Loss cost and bind probability are
+actuarially and regulatorily distinct; keeping them separate (and feature-
+isolated, see §2.4) keeps each independently auditable and matches how a
+real pricing/underwriting org is actually governed.
+
+**"Why isn't the premium itself ML-predicted?"** — Because premium
+includes policy decisions (loads, margin, hard-stops) that must be
+attributable to management/actuarial sign-off, not to a model that could
+silently drift with retraining.
+
+**"How do we know the explanations are correct, not just plausible?"** —
+They're either an exact Shapley decomposition (tree models, mathematically
+guaranteed to sum to the prediction) or exact GLM coefficients, or exact
+arithmetic (the appetite penalty formula) — never an approximation, and the
+audit panel reconciles the numbers to prove it.
+
+**"What happens if the AI narrative service goes down?"** — Nothing
+breaks. Every function in `ai_narrator.py` returns `None` on any failure,
+and the app falls back to the existing rule-based summary text.
+
+**"How were the models validated?"** — Time-based (not random) 80/20
+split by quote date, per §3, with held-out predictions persisted for
+independent evaluation (`train/evaluate_models.py`).

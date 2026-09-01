@@ -1,0 +1,607 @@
+<title>The Underwriting Engine</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+<style>
+  :root{
+    --paper:#F1F3F7;
+    --paper-raised:#FFFFFF;
+    --ink:#101826;
+    --ink-soft:#4B5768;
+    --ink-faint:#7C879A;
+    --line:#D8DEE9;
+    --accent:#2E86FF;
+    --accent-soft:#E8F1FF;
+    --accent-deep:#0B2545;
+    --band-preferred:#2FAE6B;
+    --band-standard:#2E86FF;
+    --band-nonstandard:#F5A623;
+    --band-decline:#E5484D;
+    --band-hardstop:#8A1C1C;
+    --shadow: 0 1px 2px rgba(11,37,69,0.05), 0 8px 24px rgba(11,37,69,0.06);
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --paper:#0C1220;
+      --paper-raised:#141C2C;
+      --ink:#EDF1F7;
+      --ink-soft:#AEB9CC;
+      --ink-faint:#7A879C;
+      --line:#28324580;
+      --accent:#5B9DFF;
+      --accent-soft:#17243D;
+      --accent-deep:#BFD7FF;
+      --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 8px 28px rgba(0,0,0,0.35);
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"]{
+    --paper:#0C1220;
+    --paper-raised:#141C2C;
+    --ink:#EDF1F7;
+    --ink-soft:#AEB9CC;
+    --ink-faint:#7A879C;
+    --line:#28324580;
+    --accent:#5B9DFF;
+    --accent-soft:#17243D;
+    --accent-deep:#BFD7FF;
+    --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 8px 28px rgba(0,0,0,0.35);
+    color-scheme: dark;
+  }
+
+  *{ box-sizing:border-box; }
+  body{
+    margin:0;
+    background:var(--paper);
+    color:var(--ink);
+    font-family:'IBM Plex Sans', ui-sans-serif, system-ui, sans-serif;
+    font-size:16.5px;
+    line-height:1.65;
+    -webkit-font-smoothing:antialiased;
+  }
+  ::selection{ background:var(--accent-soft); color:var(--ink); }
+
+  a{ color:var(--accent); }
+  a:focus-visible, button:focus-visible, summary:focus-visible{
+    outline:2px solid var(--accent); outline-offset:2px; border-radius:3px;
+  }
+
+  h1,h2,h3{
+    font-family:'Fraunces', ui-serif, Georgia, serif;
+    text-wrap:balance;
+    color:var(--ink);
+    font-weight:600;
+    letter-spacing:-0.01em;
+  }
+  code, .mono, .tabular{
+    font-family:'IBM Plex Mono', ui-monospace, monospace;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .page{
+    max-width:1180px;
+    margin:0 auto;
+    padding: 48px 32px 120px;
+    display:grid;
+    grid-template-columns: 220px minmax(0,720px);
+    gap:64px;
+    justify-content:center;
+  }
+  @media (max-width: 920px){
+    .page{ grid-template-columns: minmax(0,1fr); padding: 32px 20px 80px; }
+    .railnav{ display:none; }
+  }
+
+  /* ---- left rail nav ---- */
+  .railnav{
+    position:sticky;
+    top:48px;
+    align-self:start;
+    display:flex;
+    flex-direction:column;
+    gap:2px;
+  }
+  .railnav .eyebrow{
+    font-size:11px;
+    font-weight:600;
+    letter-spacing:0.1em;
+    text-transform:uppercase;
+    color:var(--ink-faint);
+    margin-bottom:10px;
+  }
+  .railnav a{
+    color:var(--ink-soft);
+    text-decoration:none;
+    font-size:13.5px;
+    padding:6px 0 6px 12px;
+    border-left:2px solid var(--line);
+    transition:color .15s ease, border-color .15s ease;
+  }
+  .railnav a:hover{ color:var(--ink); border-color:var(--ink-faint); }
+
+  /* ---- header ---- */
+  header.hero{
+    display:flex;
+    flex-direction:column;
+    gap:18px;
+    padding-bottom:36px;
+    margin-bottom:8px;
+    border-bottom:1px solid var(--line);
+  }
+  .stamp{
+    align-self:flex-start;
+    display:inline-flex;
+    align-items:center;
+    gap:8px;
+    font-family:'IBM Plex Mono', monospace;
+    font-size:11px;
+    font-weight:600;
+    letter-spacing:0.14em;
+    text-transform:uppercase;
+    color:var(--accent-deep);
+    background:var(--accent-soft);
+    border:1px solid var(--accent);
+    border-radius:3px;
+    padding:5px 10px;
+    transform:rotate(-1deg);
+  }
+  h1.title{
+    font-size:clamp(34px, 5vw, 48px);
+    line-height:1.08;
+    margin:0;
+  }
+  .dek{
+    font-size:18px;
+    color:var(--ink-soft);
+    max-width:56ch;
+    margin:0;
+  }
+  .bandstrip{
+    display:flex;
+    gap:8px;
+    flex-wrap:wrap;
+    margin-top:6px;
+  }
+  .chip{
+    display:inline-flex;
+    align-items:center;
+    gap:6px;
+    font-size:12.5px;
+    font-weight:600;
+    padding:5px 11px 5px 8px;
+    border-radius:20px;
+    background:var(--paper-raised);
+    border:1px solid var(--line);
+    color:var(--ink-soft);
+  }
+  .dot{ width:8px; height:8px; border-radius:50%; flex:none; }
+
+  /* ---- sections ---- */
+  section{ margin: 56px 0; }
+  section:first-of-type{ margin-top: 40px; }
+  .eyebrow-label{
+    font-size:11.5px;
+    font-weight:600;
+    letter-spacing:0.1em;
+    text-transform:uppercase;
+    color:var(--accent-deep);
+    margin:0 0 8px;
+  }
+  h2{ font-size:27px; margin:0 0 14px; }
+  h3{ font-size:19px; margin:28px 0 10px; font-weight:600; }
+  p{ margin:0 0 16px; max-width:66ch; color:var(--ink); }
+  p.lede{ font-size:17.5px; color:var(--ink-soft); max-width:64ch; }
+  ul, ol{ margin:0 0 16px; padding-left:22px; max-width:64ch; }
+  li{ margin-bottom:8px; }
+  strong{ color:var(--ink); }
+
+  .card{
+    background:var(--paper-raised);
+    border:1px solid var(--line);
+    border-radius:10px;
+    padding:20px 22px;
+    box-shadow:var(--shadow);
+  }
+  .card + .card{ margin-top:14px; }
+
+  /* ---- pipeline diagram ---- */
+  .pipeline{
+    display:flex;
+    align-items:stretch;
+    gap:0;
+    flex-wrap:wrap;
+    margin:20px 0 8px;
+  }
+  .pipe-step{
+    flex:1 1 150px;
+    background:var(--paper-raised);
+    border:1px solid var(--line);
+    border-radius:10px;
+    padding:14px 16px;
+    box-shadow:var(--shadow);
+  }
+  .pipe-step b{ display:block; font-size:14px; color:var(--ink); margin-bottom:4px; }
+  .pipe-step span{ font-size:12.5px; color:var(--ink-faint); }
+  .pipe-arrow{
+    display:flex; align-items:center; justify-content:center;
+    color:var(--ink-faint); font-size:20px; padding:0 6px; flex:0 0 auto;
+  }
+  @media (max-width:640px){ .pipe-arrow{ display:none; } }
+
+  /* ---- two-lane grid ---- */
+  .lanes{ display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  @media (max-width:640px){ .lanes{ grid-template-columns:1fr; } }
+  .lane-head{
+    font-size:13px; font-weight:700; letter-spacing:0.03em;
+    margin-bottom:8px; display:flex; align-items:center; gap:8px;
+  }
+
+  /* ---- reason table ---- */
+  table.datatable{
+    width:100%; border-collapse:collapse; font-size:14px;
+  }
+  table.datatable th{
+    text-align:left; font-weight:600; color:var(--ink-faint);
+    font-size:11.5px; text-transform:uppercase; letter-spacing:0.05em;
+    padding:8px 10px; border-bottom:1px solid var(--line);
+  }
+  table.datatable td{
+    padding:9px 10px; border-bottom:1px solid var(--line); color:var(--ink);
+  }
+  table.datatable tr:last-child td{ border-bottom:none; }
+  .tablewrap{ overflow-x:auto; }
+
+  /* ---- numbered walkthrough ---- */
+  .steps{ list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:0; }
+  .steps li{
+    display:grid; grid-template-columns:40px 1fr; gap:16px;
+    padding:18px 0; border-top:1px solid var(--line); margin:0;
+  }
+  .steps li:first-child{ border-top:none; }
+  .step-num{
+    font-family:'Fraunces', serif; font-weight:600; font-size:22px; color:var(--accent-deep);
+  }
+  .steps h3{ margin:0 0 4px; font-size:16.5px; }
+  .steps p{ margin:0; font-size:14.5px; }
+
+  /* ---- scenario cards ---- */
+  .scenarios{ display:grid; grid-template-columns:repeat(2,1fr); gap:14px; margin-top:16px; }
+  @media (max-width:640px){ .scenarios{ grid-template-columns:1fr; } }
+  .scenario{
+    background:var(--paper-raised); border:1px solid var(--line); border-radius:10px;
+    padding:16px 18px; box-shadow:var(--shadow);
+  }
+  .scenario .band{
+    display:inline-block; font-size:11px; font-weight:700; letter-spacing:0.04em;
+    padding:3px 10px; border-radius:20px; color:#fff; margin-bottom:10px;
+  }
+  .scenario dl{ margin:10px 0 0; font-size:13px; color:var(--ink-soft); }
+  .scenario dl div{ display:flex; justify-content:space-between; padding:3px 0; border-bottom:1px dashed var(--line); }
+  .scenario dl div:last-child{ border-bottom:none; }
+  .scenario dt{ color:var(--ink-faint); }
+  .scenario dd{ margin:0; font-family:'IBM Plex Mono',monospace; font-variant-numeric:tabular-nums; }
+
+  /* ---- faq ---- */
+  details.faq{
+    border-bottom:1px solid var(--line);
+    padding:14px 0;
+  }
+  details.faq summary{
+    cursor:pointer; font-weight:600; font-size:15.5px; list-style:none;
+    display:flex; justify-content:space-between; align-items:center; gap:12px;
+  }
+  details.faq summary::-webkit-details-marker{ display:none; }
+  details.faq summary::after{
+    content:"+"; font-family:'Fraunces',serif; font-size:22px; color:var(--ink-faint); flex:none;
+  }
+  details.faq[open] summary::after{ content:"–"; }
+  details.faq p{ margin-top:10px; font-size:14.5px; color:var(--ink-soft); }
+
+  footer{
+    margin-top:64px; padding-top:24px; border-top:1px solid var(--line);
+    font-size:12.5px; color:var(--ink-faint);
+  }
+  footer p{ max-width:none; }
+
+  @media (prefers-reduced-motion: no-preference){
+    .card, .pipe-step, .scenario{ transition: transform .15s ease, box-shadow .15s ease; }
+  }
+</style>
+
+<div class="page">
+  <nav class="railnav" aria-label="Section navigation">
+    <div class="eyebrow">On this page</div>
+    <a href="#what">What this is</a>
+    <a href="#trust">Why it's trustworthy</a>
+    <a href="#pipeline">How it decides</a>
+    <a href="#beyond-decline">Beyond decline</a>
+    <a href="#coverage-fit">Coverage fit</a>
+    <a href="#explainability">Explainability</a>
+    <a href="#walkthrough">Live walkthrough</a>
+    <a href="#scenarios">Demo scenarios</a>
+    <a href="#faq">Anticipated questions</a>
+  </nav>
+
+  <main>
+    <header class="hero">
+      <span class="stamp">⚖ Underwriting &amp; Pricing, Demo Guide</span>
+      <h1 class="title">The Underwriting Engine</h1>
+      <p class="dek">A model-backed decisioning platform for US personal auto: three trained models, one
+        deterministic rules engine, a suggestion layer that looks past a flat decline, and an AI narrator
+        that explains the decision in plain English, without ever making it.</p>
+      <div class="bandstrip">
+        <span class="chip"><span class="dot" style="background:var(--band-preferred)"></span>Preferred</span>
+        <span class="chip"><span class="dot" style="background:var(--band-standard)"></span>Standard</span>
+        <span class="chip"><span class="dot" style="background:var(--band-nonstandard)"></span>Non-Standard</span>
+        <span class="chip"><span class="dot" style="background:var(--band-decline)"></span>Decline</span>
+        <span class="chip"><span class="dot" style="background:var(--band-hardstop)"></span>Hard Stop</span>
+      </div>
+    </header>
+
+    <section id="what">
+      <p class="eyebrow-label">What This Is</p>
+      <h2>One submission in, one full underwriting decision out</h2>
+      <p class="lede">A new personal auto submission arrives, driver, vehicle, claims history, coverage
+        detail. Today, deciding what to do with it means a human underwriter reads the file, applies
+        judgment, and reaches a price and a verdict. That judgment is valuable, but it isn't fast and
+        it isn't perfectly consistent between two different underwriters on two different days.</p>
+      <p>This platform runs the same submission through three trained models and a fully documented rules
+        engine in under a second, and returns exactly what an underwriter would want to see: a risk band,
+        a price, a recommended action, the reasoning behind all three, and, when the answer would
+        otherwise be a flat decline, the alternatives a human underwriter would actually consider first.</p>
+      <p>It has two working tabs: a <strong>Dashboard</strong> for the existing 22,000-submission book, and
+        an <strong>Interface</strong> for scoring one hypothetical submission live.</p>
+    </section>
+
+    <section id="trust">
+      <p class="eyebrow-label">Why It's Trustworthy</p>
+      <h2>The AI narrates. It never decides.</h2>
+      <p class="lede">This is the single most important thing to say out loud in the room. Every number a
+        client will see, the band, the premium, the score, the reason codes, comes from deterministic
+        code that runs identically every time. The AI layer (Azure OpenAI, GPT-4o) is added on top,
+        strictly to turn those already-computed facts into a readable paragraph. It is instructed never to
+        introduce a number, a reason, or a recommendation that wasn't already computed, and if the
+        AI service is ever unreachable, the app falls back to the plain rule-based text with nothing
+        missing and nothing broken.</p>
+      <div class="lanes">
+        <div class="card">
+          <div class="lane-head" style="color:var(--accent-deep)">Deterministic core</div>
+          <p style="margin:0;font-size:14px;">Hard-stop rules, appetite scoring, premium build-up, and the
+            composite-score weights are business policy written in code, the same inputs always produce
+            the same output, and every one of those rules can be pointed to and read.</p>
+        </div>
+        <div class="card">
+          <div class="lane-head" style="color:#7C3AED">AI narrative layer</div>
+          <p style="margin:0;font-size:14px;">GPT-4o receives the finished figures and reason codes as
+            ground truth and is instructed to only phrase and prioritize them. It writes the summary
+            paragraph; it does not touch the math.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="pipeline">
+      <p class="eyebrow-label">How It Decides</p>
+      <h2>Three models feed one governed pipeline</h2>
+      <p>Two of the three model outputs are risk (frequency, severity); one is commercial (bind
+        likelihood). They never see each other's inputs, a documented no-leakage rule, and none of
+        them ever sees a post-outcome field. The rules engine is the only place decisions get made.</p>
+      <div class="pipeline">
+        <div class="pipe-step"><b>Frequency</b><span>XGBoost, Poisson objective, expected claim count</span></div>
+        <div class="pipe-arrow">→</div>
+        <div class="pipe-step"><b>Severity</b><span>Gamma GLM, expected cost per claim</span></div>
+        <div class="pipe-arrow">→</div>
+        <div class="pipe-step"><b>Bind</b><span>LightGBM, likelihood the quote converts</span></div>
+        <div class="pipe-arrow">→</div>
+        <div class="pipe-step"><b>Rules engine</b><span>Hard-stops, appetite, premium, composite score</span></div>
+        <div class="pipe-arrow">→</div>
+        <div class="pipe-step"><b>Decision</b><span>Band, price, and a recommended action</span></div>
+      </div>
+      <h3>The composite score</h3>
+      <p style="font-size:14.5px;">
+        <code class="tabular">Composite = 50% × (100 − Loss Propensity) + 20% × Bind Propensity + 30% × Appetite</code>
+       , loss risk dominates by design; a high bind likelihood alone can never push a bad risk into an
+        approval. Bands: <strong>72+</strong> Preferred · <strong>55–71</strong> Standard ·
+        <strong>38–54</strong> Non-Standard · <strong>below 38</strong> Decline, unless a hard-stop
+        rule fires first, in which case the score is forced to reflect it regardless of the raw math.
+      </p>
+    </section>
+
+    <section id="beyond-decline">
+      <p class="eyebrow-label">Suggestions</p>
+      <h2>Beyond decline</h2>
+      <p class="lede">A "Decline" band or a triggered hard-stop rule doesn't automatically end the
+        conversation. The engine checks a second question first: is this reason genuinely non-negotiable,
+        or is there a real underwriting move here? Only three reasons are treated as truly mandatory , 
+        everything else gets a re-scored alternative.</p>
+      <div class="lanes" style="grid-template-columns:1fr 1fr 1fr;">
+        <div class="card">
+          <div class="lane-head" style="color:var(--band-standard)">Modify Terms</div>
+          <p style="margin:0;font-size:13.5px;">Raise deductibles, or correct a misclassified business-use
+            vehicle, re-rated through the same engine, not a guess.</p>
+        </div>
+        <div class="card">
+          <div class="lane-head" style="color:var(--band-nonstandard)">Price-Up / Non-Standard</div>
+          <p style="margin:0;font-size:13.5px;">Quote at a non-standard load, or route to a specialty/E&amp;S
+            placement partner instead of a flat no.</p>
+        </div>
+        <div class="card">
+          <div class="lane-head" style="color:#0EA5A4">Conditional Acceptance</div>
+          <p style="margin:0;font-size:13.5px;">Require telematics enrollment, a monitored lapse period, or
+            a vehicle inspection, then re-evaluate.</p>
+        </div>
+      </div>
+      <h3>What's actually non-negotiable</h3>
+      <p>DUI/DWI conviction, license suspension, and a confirmed fraud indicator. Every other hard-stop
+        reason, coverage lapse, undeclared business use, a vehicle value over the carrier's cap, prior
+        total loss, a state outside the appetite footprint, gets a specific alternative, not a form
+        letter.</p>
+    </section>
+
+    <section id="coverage-fit">
+      <p class="eyebrow-label">Suggestions, Continued</p>
+      <h2>The same risk, priced under every coverage option</h2>
+      <p class="lede">Every scored submission also gets a Coverage Fit table: the identical risk, re-run
+        through the full pipeline once per coverage option (UM/UIM Only, Liability Only, Comprehensive
+        Only, Collision Only, Full Coverage). Coverage isn't treated as a footnote adjustment here, it
+        changes the actual Collision/Comprehensive/UM-UIM flags the loss models read, so each row carries
+        its own technical premium, quoted premium, appetite, and composite score, not a shared number with
+        a label changed.</p>
+      <p>When a narrower coverage form gives the same risk a better band or a meaningfully better score,
+        the table surfaces it as a named suggestion with the real premium delta attached, e.g. "Consider
+        writing this as Comprehensive Only: composite 62.5 becomes 71.2, quoted premium $185 lower." When
+        nothing beats the current selection, or a hard-stop rule applies regardless of coverage, it says so
+        plainly instead of forcing a recommendation that doesn't hold up.</p>
+      <p style="font-size:14px; color:var(--ink-soft);">One honest edge case worth knowing before someone
+        else finds it live: on a renewal, pricing is held within a guardrail band of last year's premium
+        (60%-190%). If every coverage option's underlying cost still falls outside that band, all five
+        quote to the identical capped number, that's the guardrail binding uniformly, not a bug, and the
+        app says so directly under the table when it happens.</p>
+    </section>
+
+    <section id="explainability">
+      <p class="eyebrow-label">Explainability</p>
+      <h2>Real reason codes, not a guess at them</h2>
+      <p class="lede">The loss and bind reason codes are not an approximation layered on afterward, they
+        are XGBoost's and LightGBM's own native contribution output, the exact same mechanism the
+        third-party <code>shap</code> library wraps for tree models. The appetite reason codes are an exact
+        read of the rules engine's own penalty formula. Nothing here is estimated.</p>
+      <div class="tablewrap">
+        <table class="datatable">
+          <thead><tr><th>Panel</th><th>Source</th><th>What it shows</th></tr></thead>
+          <tbody>
+            <tr><td>Loss Risk Drivers</td><td class="mono">XGBoost + GLM contributions</td><td>Top factors moving expected loss cost, longest first</td></tr>
+            <tr><td>Bind Propensity Drivers</td><td class="mono">LightGBM contributions</td><td>Top factors moving likelihood to bind</td></tr>
+            <tr><td>Appetite / Eligibility</td><td class="mono">Rules-engine formula</td><td>Exact point penalties behind the appetite score</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Each panel is one horizontal bar chart: bars right of center make the outcome worse, bars left
+        make it better, longest driver at the top. Deliberately plain, no relativities or log-space math
+        on screen, just what moved the number and by how much.</p>
+
+      <h3>Two safeguards worth knowing</h3>
+      <ul>
+        <li>If a field was never actually observed for this submission (e.g. a telematics score for a
+          driver who isn't enrolled), it's excluded from the named reason codes rather than shown as if it
+          were real. It's still accounted for in "all other factors" behind the scenes, so the underlying
+          decomposition (visible in Technical &amp; audit detail) still adds up exactly to the real
+          prediction.</li>
+        <li>The age input accepts any realistic value, but the training book's oldest driver is 85. Past
+          that point the app tells you the model is extrapolating, not applying a calibrated pattern,
+          rather than presenting an unproven number with the same confidence as a real one.</li>
+      </ul>
+    </section>
+
+    <section id="walkthrough">
+      <p class="eyebrow-label">Live Walkthrough</p>
+      <h2>Running the demo</h2>
+      <ol class="steps">
+        <li><span class="step-num">1</span><div><h3>Open the Dashboard tab</h3><p>Point at the KPI row and
+          the risk-band distribution first, this is the existing 22,000-submission book, not synthetic
+          decoration. Filter by state or channel to show it's live, not a static export.</p></div></li>
+        <li><span class="step-num">2</span><div><h3>Switch to Interface</h3><p>A row of one-click scenario
+          buttons sits at the top, load one instead of typing a full submission live. Inputs sit in a panel
+          on the left grouped into six numbered, expandable sections; results build in a panel on the
+          right, so the verdict lands next to the form rather than far below it.</p></div></li>
+        <li><span class="step-num">3</span><div><h3>Click Calculate Risk Score</h3><p>(Skip this if you
+          loaded a scenario, it runs automatically.) The result banner, AI narrative, and score metrics
+          appear on the right. The AI call typically takes a couple of seconds, a spinner marks it, and
+          everything else has already rendered by then.</p></div></li>
+        <li><span class="step-num">4</span><div><h3>Walk down the results in order</h3><p>Result banner →
+          AI Underwriting Narrative → scores → premium build → <strong>Coverage Fit &amp;
+          Suggestions</strong> (same risk, every coverage option) → <strong>Why This Score</strong> (the
+          three driver-bar panels) → <strong>Underwriter Recommendations</strong> (only appears for
+          Decline/Hard Stop) → Technical &amp; audit detail, for anyone who wants the raw figures.</p></div></li>
+      </ol>
+    </section>
+
+    <section id="scenarios">
+      <p class="eyebrow-label">Built Into The App</p>
+      <h2>Five scenarios, one click each</h2>
+      <p>These aren't hypothetical talking points, they're buttons at the top of the Interface tab. Each
+        one is a real row pulled from the 22,000-submission book and verified to land on its labeled
+        outcome through the live scoring path, not a hand-typed guess at values that might work. Load one,
+        the result runs automatically.</p>
+      <div class="scenarios">
+        <div class="scenario">
+          <span class="band" style="background:var(--band-preferred)">Preferred</span>
+          <p style="margin:0;font-size:13.5px;"><strong>Clean preferred risk</strong>: experienced,
+            low-mileage driver, no claims or violations, telematics enrolled.</p>
+          <dl>
+            <div><dt>Shows</dt><dd>Auto-Quote / STP, clean coverage fit</dd></div>
+          </dl>
+        </div>
+        <div class="scenario">
+          <span class="band" style="background:var(--band-standard)">Standard</span>
+          <p style="margin:0;font-size:13.5px;"><strong>Standard risk, light review</strong>:
+            long-tenured driver with one prior claim.</p>
+          <dl>
+            <div><dt>Shows</dt><dd>Light UW Review, plus a genuine coverage-fit suggestion (Comprehensive
+              Only scores meaningfully better on this one)</dd></div>
+          </dl>
+        </div>
+        <div class="scenario">
+          <span class="band" style="background:var(--band-decline)">Decline</span>
+          <p style="margin:0;font-size:13.5px;"><strong>Falls below appetite</strong>: no
+            violations, but the loss-cost profile scores out of appetite.</p>
+          <dl>
+            <div><dt>Shows</dt><dd>Full Suggestions panel: telematics, deductibles, non-standard load</dd></div>
+          </dl>
+        </div>
+        <div class="scenario">
+          <span class="band" style="background:var(--band-hardstop)">Hard Stop (negotiable)</span>
+          <p style="margin:0;font-size:13.5px;"><strong>Undeclared business use</strong>: hard-stops
+            on misrepresentation, but it's a negotiable one.</p>
+          <dl>
+            <div><dt>Shows</dt><dd>"Reclassify to declared business use", re-rated, not just refused</dd></div>
+          </dl>
+        </div>
+        <div class="scenario">
+          <span class="band" style="background:var(--band-hardstop)">Hard Stop (mandatory)</span>
+          <p style="margin:0;font-size:13.5px;"><strong>DUI on record</strong>: the one category
+            with no underwriting discretion.</p>
+          <dl>
+            <div><dt>Shows</dt><dd>Explicit "no discretionary override" message, the honest answer</dd></div>
+          </dl>
+        </div>
+      </div>
+    </section>
+
+    <section id="faq">
+      <p class="eyebrow-label">Anticipated Questions</p>
+      <h2>Likely questions in the room</h2>
+      <details class="faq" open>
+        <summary>Is the AI actually making the underwriting decision?</summary>
+        <p>No. The band, premium, and every reason code are computed before the AI is ever called. The AI
+          writes a paragraph explaining those already-final numbers, it has no path to change them.</p>
+      </details>
+      <details class="faq">
+        <summary>What happens if the AI service is down during the meeting?</summary>
+        <p>Nothing breaks. Every AI call is wrapped so a failure of any kind returns silently, and the app
+          falls back to the plain rule-based summary and recommendation cards it already had. The scoring
+          and recommendation math never depends on the AI being reachable.</p>
+      </details>
+      <details class="faq">
+        <summary>Is this auditable for a regulator?</summary>
+        <p>Every hard-stop reason, premium load, and score weight is a named constant in the rules engine,
+          not a learned parameter. The loss and bind reason codes are exact model contributions, not a
+          post-hoc estimate. The "Technical &amp; audit detail" panel on every scored submission exposes
+          the full underlying figures.</p>
+      </details>
+      <details class="faq">
+        <summary>What data is this trained and demonstrated on?</summary>
+        <p>A 22,000-row synthetic personal-auto book, no real persons, vehicles, or policies. It exists to
+          demonstrate the mechanism end to end; production deployment would retrain against a carrier's
+          real book under the same no-leakage governance rules already enforced here.</p>
+      </details>
+    </section>
+
+    <footer>
+      <p>Personal Auto Underwriting &amp; Pricing, Streamlit app · XGBoost (frequency) · Gamma GLM
+        (severity) · LightGBM (bind) · deterministic rules engine · Azure OpenAI GPT-4o (narrative layer,
+        optional). Prepared as a companion to the live demo, not a replacement for it.</p>
+    </footer>
+  </main>
+</div>
